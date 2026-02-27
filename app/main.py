@@ -35,7 +35,9 @@ async def parse_endpoint(
     pdf_bytes = await pdf.read()
 
     config_all = load_base_config()
-    base_cfg = config_all.get(base_id)
+    base_id_norm = (base_id or "").lower().strip()
+    base_cfg = config_all.get(base_id_norm)
+
     if not base_cfg:
         raise HTTPException(status_code=400, detail=f"Base '{base_id}' não cadastrada em db/base_config.json")
 
@@ -49,7 +51,7 @@ async def parse_endpoint(
         ranges["composicoes"] = (0, 0)
 
     result = parse_document(
-        base_id=base_id,
+        base_id=base_id_norm,
         pdf_bytes=pdf_bytes,
         ranges=ranges,
         config=base_cfg,
