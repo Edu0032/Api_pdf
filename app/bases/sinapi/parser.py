@@ -88,15 +88,26 @@ def parse_sinapi(
     item_refs_list = _collect_item_refs(orc.itens_raiz)
 
     # Avisar e remover "insumo citado no orçamento"
-    insumos_no_orc = [r for r in item_refs_list if _is_probably_insumo_codigo(str(r.get("codigo", "")))]
-    if insumos_no_orc:
-        exemplos = ", ".join([f"{r.get('ref_id')} (item {r.get('item')})" for r in insumos_no_orc[:8]])
-        avisos.append(
-            f"[orcamento] ATENÇÃO: {len(insumos_no_orc)} INSUMO(S) apareceram no orçamento como item. "
-            f"Isso costuma ser erro do documento/planilha. Exemplos: {exemplos}"
-        )
-        # remove do que será cobrado como composição esperada
-        item_refs_list = [r for r in item_refs_list if r not in insumos_no_orc]
+    # detectar insumos citados como item de orçamento (ex.: 00000370)
+    insumos_no_orc = []
+
+    def _walk_nodes(nodes):
+        for n in nodes or []:
+            yield n
+            yield from _walk_nodes(getattr(n, "filhos", None) or (n.get("filhos") if isinstance(n, dict) else []) or [])
+
+    for n in _walk_nodes(orc.itens_raiz):
+        tipo = (getattr(n, "tipo", None) if not isinstance(n, dict) else n.get("tipo")) or ""
+        if str(tipo).lower() != "item":
+            continue
+        codigo = (getattr(n, "codigo", None) if not isinstance(n, dict) else n.get("codigo")) or ""
+        fonte = (getattr(n, "fonte", None) if not isinstance(n, dict) else n.get("fonte")) or ""
+        item = (getattr(n, "item", None) if not isinstance(n, dict) else n.get("item")) or ""
+        if _is_probably_insumo_codigo(str(codigo), str(fonte)):
+            insumos_no_orc.append(f"{codigo}|{fonte} (item {item})")
+
+    for rid in sorted(set(insumos_no_orc)):
+        avisos.append(f"Insumo citado no orçamento como item de composição: {rid}. Revisar planilha/PDF.")
 
     # Também remover placeholders do tipo COMPOSICAO
     placeholders = [r for r in item_refs_list if str(r.get("codigo", "")).strip().upper() == "COMPOSICAO"]
@@ -631,36 +642,44 @@ def _is_probable_group_heading(desc: str) -> bool:
 
 from typing import Any, Dict, List
 
-def _collect_item_refs(itens_raiz: Any) -> List[Dict[str, str]]:
+def _node_get(n: Any, key: str, default: Any = "") -> Any:
+    if isinstance(n, dict):
+        return n.get(key, default)
+    return getattr(n, key, default)
+
+def _node_children(n: Any) -> List[Any]:
+    ch = _node_get(n, "filhos", []) or []
+    return list(ch)
+
+def _is_probably_insumo_codigo(codigo: str, banco: str) -> bool:
+    c = (codigo or "").strip()
+    b = (banco or "").strip().upper()
+    return b == "SINAPI" and c.isdigit() and c.startswith("0000")
+
+def _collect_item_refs(itens_raiz) -> List[Dict[str, str]]:
     """
     Retorna lista de refs:
       [{"item":"9.4", "ref_id":"CODIGO|BANCO"}, ...]
-    Aceita nós como dict OU como Pydantic (OrcamentoItem).
+    Ignora:
+      - placeholder "COMPOSICAO"
+      - códigos que parecem INSUMO (ex.: 0000xxxx) — esses devem virar AVISO, não referência de composição
     """
     refs: List[Dict[str, str]] = []
 
-    def _get(node: Any, key: str, default: Any = "") -> Any:
-        if node is None:
-            return default
-        if isinstance(node, dict):
-            return node.get(key, default)
-        # Pydantic/BaseModel (OrcamentoItem)
-        return getattr(node, key, default)
-
-    def _children(node: Any) -> List[Any]:
-        ch = _get(node, "filhos", []) or []
-        return list(ch)
-
-    def _walk(nodes: Any):
+    def walk(nodes):
         for n in nodes or []:
-            tipo = str(_get(n, "tipo", "") or "").strip().lower()
-            if tipo == "item":
-                item = str(_get(n, "item", "") or "").strip()
-                codigo = str(_get(n, "codigo", "") or "").strip()
-                banco = str(_get(n, "fonte", "") or "").strip()  # no orçamento chama "fonte"
-                if item and codigo and banco:
-                    refs.append({"item": item, "ref_id": f"{codigo}|{banco}"})
-            _walk(_children(n))
+            tipo = str(_node_get(n, "tipo", "") or "").strip().lower()
 
-    _walk(itens_raiz)
+            if tipo == "item":
+                item = str(_node_get(n, "item", "") or "").strip()
+                codigo = str(_node_get(n, "codigo", "") or "").strip()
+                banco = str(_node_get(n, "fonte", "") or "").strip()  # orçamento usa "fonte"
+
+                if item and codigo and banco:
+                    if codigo.strip().upper() != "COMPOSICAO" and not _is_probably_insumo_codigo(codigo, banco):
+                        refs.append({"item": item, "ref_id": f"{codigo}|{banco}"})
+
+            walk(_node_children(n))
+
+    walk(itens_raiz)
     return refs
