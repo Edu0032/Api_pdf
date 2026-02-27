@@ -1,0 +1,47 @@
+{
+  "sinapi": {
+    "page_indexing": "1-based",
+    "synthetic": {
+      "header_markers": ["ANEXO 1 - ORÇAMENTO SINTÉTICO"],
+      "ignore_markers": ["ESTADO DO ACRE", "SECRETARIA", "PARÂMETROS SINAPI"]
+    },
+    "compositions": {
+      "header_markers": ["ANEXO 3", "COMPOSIÇÕES ANALÍTICAS"],
+      "ignore_markers": ["ESTADO DO ACRE", "SECRETARIA", "PARÂMETROS SINAPI"]
+    },
+    "sanitizer": {
+      "break_before": ["ESTADO DO", "SECRETARIA", "PARÂMETROS", "Objeto:", "Município:", "Endereço:", "Data-base", "Enc. Sociais", "Página", "ANEXO"],
+      "strip_inline_from": ["ESTADO DO", "SECRETARIA", "PARÂMETROS", "Objeto:", "Município:", "Endereço:", "Data-base", "Enc. Sociais", "Página", "ANEXO"],
+      "drop_lines_if_contains": ["ANEXO 1 - ORÇAMENTO SINTÉTICO", "ITEM CÓDIGO FONTE", "CUSTO UNITÁRIO"],
+      "toxic_for_continuation": ["ESTADO DO", "SECRETARIA", "PARÂMETROS", "Objeto:", "Município:", "Endereço:", "Data-base", "Enc. Sociais", "Página", "ANEXO"]
+    },
+    "validation": {
+      "strict": false,
+      "allow_missing_group_total": true,
+      "missing_group_total_value": "",
+      "fail_if_contaminated_text": true,
+      "tolerances": {
+        "item_abs": 0.02,
+        "item_rel": 0.0002,
+        "group_abs": 0.05,
+        "group_rel": 0.0001
+      }
+    },
+    "table_headers": {
+      "aliases": {
+        "item": ["ITEM"],
+        "codigo": ["CÓDIGO", "CODIGO", "CÓD."],
+        "fonte": ["FONTE"],
+        "especificacao": ["ESPECIFICAÇÕES DOS SERVIÇOS", "ESPECIFICAÇÕES", "ESPECIFICACOES", "DESCRIÇÃO", "DESCRICAO"],
+        "und": ["UND", "UNIDADE", "UNID", "U.M.", "UM", "UN"],
+        "quant": ["QUANT", "QUANT.", "QTD", "QUANTIDADE"],
+        "custo_unitario_sem_bdi": ["CUSTO UNITÁRIO S/BDI", "S/BDI", "SEM BDI"],
+        "custo_unitario_com_bdi": ["CUSTO UNITÁRIO C/BDI", "C/BDI", "COM BDI"],
+        "custo_parcial": ["CUSTO PARCIAL", "PARCIAL", "TOTAL PARCIAL"],
+        "custo_total": ["CUSTO TOTAL", "TOTAL"]
+      },
+      "required": ["item", "codigo", "fonte", "und", "quant", "custo_parcial"],
+      "min_similarity": 0.88
+    }
+  }
+}

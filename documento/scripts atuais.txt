@@ -1,0 +1,1550 @@
+composicoes_parser.py
+# app/bases/sinapi/composicoes_parser.py
+import io
+import re
+import unicodedata
+from typing import Dict, Any, Optional, Tuple, List
+
+import pdfplumber
+
+from app.bases.sinapi.schemas import Composicoes, BlocoComposicao, LinhaComposicao, LinhaInsumo
+
+
+_RE_SPACES = re.compile(r"\s+")
+_RE_ITEM = re.compile(r"^\d+(?:\.\d+)*$")  # 1.2.3 etc
+
+
+def limpar(x: Any) -> str:
+    if x is None:
+        return ""
+    return str(x).replace("\r", "\n").strip()
+
+
+def colapsar_espacos(s: str) -> str:
+    return _RE_SPACES.sub(" ", s.replace("\n", " ")).strip()
+
+
+def _strip_accents_upper(s: str) -> str:
+    s = colapsar_espacos(s)
+    if not s:
+        return ""
+    nfkd = unicodedata.normalize("NFKD", s)
+    return "".join([c for c in nfkd if not unicodedata.combining(c)]).upper()
+
+
+def parse_pt_number(s: str) -> Optional[float]:
+    """
+    Converte "1.234,56" -> 1234.56
+    Converte "0,3729000" -> 0.3729
+    """
+    s = colapsar_espacos(s)
+    if not s:
+        return None
+    s2 = s.replace(".", "").replace(",", ".")
+    try:
+        return float(s2)
+    except ValueError:
+        return None
+
+
+def split_codigo_banco_embutido(codigo_raw: str) -> Tuple[str, str]:
+    """
+    "00000367/ SINAPI" -> ("00000367", "SINAPI")
+    """
+    codigo_raw = colapsar_espacos(codigo_raw)
+    if "/" not in codigo_raw:
+        return codigo_raw, ""
+    a, b = codigo_raw.split("/", 1)
+    return a.strip(), colapsar_espacos(b)
+
+
+def to_pdf_index(page_num: int, page_indexing: str) -> int:
+    """
+    Converte página "humana" -> índice do pdfplumber (0-based).
+    """
+    if page_indexing.lower().startswith("1"):
+        return page_num - 1
+    return page_num
+
+
+def row_get(row: List[Any], idx: int) -> str:
+    if idx >= len(row):
+        return ""
+    return limpar(row[idx])
+
+
+def normalize_row(row: List[Any]) -> List[Any]:
+    """
+    Alguns PDFs quebram "Composição" em duas colunas:
+      ["Composiçã", "o", "SEE2832", "Próprio", ...]
+    Aqui juntamos as duas primeiras e deslocamos a linha.
+    """
+    if not row or len(row) < 2:
+        return row
+    c0 = colapsar_espacos(limpar(row[0])).lower()
+    c1 = colapsar_espacos(limpar(row[1])).lower()
+
+    if c0.startswith("compos") and (c1 == "o" or c1.startswith("o aux")):
+        # junta e remove a segunda célula
+        row = list(row)
+        row[0] = f"{limpar(row[0])} {limpar(row[1])}"
+        del row[1]
+        return row
+
+    return row
+
+
+def is_item_header_row(row: List[Any]) -> bool:
+    """
+    Header típico do bloco:
+      ["9.4", "Código", "Banco", "Descrição", "Tipo", "Und", "Quant.", "Valor Unit", "Total"]
+    """
+    if not row or len(row) < 2:
+        return False
+    c0 = colapsar_espacos(limpar(row[0]))
+    c1 = colapsar_espacos(limpar(row[1])).lower()
+    return bool(_RE_ITEM.match(c0)) and c1.startswith("cód")
+
+
+def is_column_header_only(row: List[Any]) -> bool:
+    """
+    Continuação de página:
+      ["", "Código", "Banco", ...]
+    """
+    if not row or len(row) < 2:
+        return False
+    c0 = colapsar_espacos(limpar(row[0]))
+    c1 = colapsar_espacos(limpar(row[1])).lower()
+    return (c0 == "") and c1.startswith("cód")
+
+
+def detect_row_type(c0_raw: str) -> Optional[str]:
+    """
+    Detecta:
+      - composicao
+      - composicao_auxiliar
+      - insumo
+    """
+    c0 = colapsar_espacos(c0_raw).lower()
+    if not c0:
+        return None
+
+    if c0.startswith("insumo"):
+        return "insumo"
+
+    if c0.startswith("compos"):
+        if "auxiliar" in c0:
+            return "composicao_auxiliar"
+        return "composicao"
+
+    return None
+
+
+def build_entry_from_row(row: List[Any], row_type: str) -> Dict[str, Any]:
+    """
+    Esperado:
+      0 Tipo
+      1 Código
+      2 Banco
+      3 Descrição
+      4 Tipo (categoria)
+      5 Und
+      6 Quant.
+      7 Valor Unit
+      8 Total
+    """
+    codigo_raw = row_get(row, 1)
+    banco_col = colapsar_espacos(row_get(row, 2))
+
+    codigo = colapsar_espacos(codigo_raw)
+    banco_embutido = ""
+
+    if row_type == "insumo":
+        codigo_split, banco_split = split_codigo_banco_embutido(codigo_raw)
+        if banco_split:
+            codigo = codigo_split
+            banco_embutido = banco_split
+
+    banco_final = banco_embutido or banco_col
+
+    return {
+        "codigo": codigo,
+        "banco": banco_final,
+        "descricao": colapsar_espacos(row_get(row, 3)),
+        "tipo": colapsar_espacos(row_get(row, 4)),
+        "und": colapsar_espacos(row_get(row, 5)),
+        "quant": parse_pt_number(row_get(row, 6)),
+        "valor_unit": parse_pt_number(row_get(row, 7)),
+        "total": parse_pt_number(row_get(row, 8)),
+    }
+
+
+def _make_id(codigo: str, banco: str) -> str:
+    return f"{colapsar_espacos(codigo)}|{colapsar_espacos(banco)}"
+
+
+def _make_id_norm(codigo: str, banco: str) -> str:
+    return f"{_strip_accents_upper(codigo)}|{_strip_accents_upper(banco)}"
+
+
+def parse_composicoes_sinapi(
+    pdf_bytes: bytes,
+    start_1based: int,
+    end_1based: int,
+    config: Dict[str, Any],
+    itens_plano: Optional[List[Dict[str, Any]]] = None,
+    item_refs: Optional[List[Dict[str, Any]]] = None,
+    context: Any = None,
+) -> Tuple[Composicoes, List[str], List[str], List[str], List[str]]:
+    """
+    Retorna:
+      (composicoes, avisos, erros, itens_faltando, itens_extras)
+
+    - start_1based/end_1based vêm da API (normalmente 1-based).
+    - item_refs (se vier) deve conter dicts com ref_id="COD|BANCO" e item="9.4" etc.
+    """
+    avisos: List[str] = []
+    erros: List[str] = []
+
+    page_indexing = config.get("page_indexing", "1-based")
+
+    # Abre PDF
+    try:
+        pdf = pdfplumber.open(io.BytesIO(pdf_bytes))
+    except Exception as e:
+        erros.append(f"Falha ao abrir PDF (pdfplumber): {e}")
+        return Composicoes(principais={}, auxiliares_globais={}), avisos, erros, [], []
+
+    with pdf:
+        n_pages = len(pdf.pages)
+        req_start, req_end = start_1based, end_1based
+
+        # Converte (e tolera caso start venha 0 por engano)
+        if page_indexing.lower().startswith("1") and (start_1based <= 0 or end_1based <= 0):
+            avisos.append(
+                f"[composicoes] Range suspeito (start/end <= 0) com page_indexing=1-based: {start_1based}-{end_1based}. "
+                "Vou tratar como 0-based para evitar offset duplo."
+            )
+            start_idx = start_1based
+            end_idx = end_1based
+        else:
+            start_idx = to_pdf_index(start_1based, page_indexing)
+            end_idx = to_pdf_index(end_1based, page_indexing)
+
+        # Clamp + aviso quando range vem fora do PDF
+        start_idx_clamped = max(0, min(start_idx, n_pages - 1))
+        end_idx_clamped = max(0, min(end_idx, n_pages - 1))
+
+        if (start_idx_clamped != start_idx) or (end_idx_clamped != end_idx):
+            avisos.append(
+                f"[composicoes] Range fora do PDF: solicitado {req_start}-{req_end} ({page_indexing}), "
+                f"PDF tem {n_pages} páginas. Usando clamp para {start_idx_clamped+1}-{end_idx_clamped+1} (1-based)."
+            )
+
+        start_idx, end_idx = start_idx_clamped, end_idx_clamped
+        if end_idx < start_idx:
+            start_idx, end_idx = end_idx, start_idx
+
+        # Mapa ref_id -> item (pra preencher item mesmo se header não aparecer)
+        id_to_item: Dict[str, str] = {}
+        if item_refs:
+            for r in item_refs:
+                rid = str(r.get("ref_id") or "").strip()
+                it = str(r.get("item") or "").strip()
+                if rid and it:
+                    id_to_item[_make_id_norm(*rid.split("|", 1)) if "|" in rid else _strip_accents_upper(rid)] = it
+
+        principais: Dict[str, BlocoComposicao] = {}
+        auxiliares_globais: Dict[str, LinhaComposicao] = {}
+
+        current_item = ""
+        current_bloco: Optional[BlocoComposicao] = None
+
+        # Configurações de extração de tabela (tenta linhas, depois texto)
+        table_settings_lines = {
+            "vertical_strategy": "lines",
+            "horizontal_strategy": "lines",
+            "intersection_tolerance": 5,
+            "snap_tolerance": 3,
+            "join_tolerance": 3,
+            "edge_min_length": 3,
+        }
+        table_settings_text = {
+            "vertical_strategy": "text",
+            "horizontal_strategy": "text",
+            "intersection_tolerance": 5,
+            "snap_tolerance": 3,
+            "join_tolerance": 3,
+        }
+
+        for pi in range(start_idx, end_idx + 1):
+            page = pdf.pages[pi]
+
+            tables = page.extract_tables(table_settings=table_settings_lines) or []
+            if not tables:
+                tables = page.extract_tables(table_settings=table_settings_text) or []
+
+            for tb in tables:
+                for raw_row in tb:
+                    if not raw_row:
+                        continue
+
+                    # ignora linha totalmente vazia
+                    if all(colapsar_espacos(limpar(c)) == "" for c in raw_row if c is not None):
+                        continue
+
+                    row = normalize_row(list(raw_row))
+
+                    # header por item
+                    if is_item_header_row(row):
+                        # fecha bloco anterior
+                        if current_bloco is not None:
+                            pid = _make_id(current_bloco.principal.codigo, current_bloco.principal.banco)
+                            principais[pid] = current_bloco
+                            current_bloco = None
+
+                        current_item = colapsar_espacos(row_get(row, 0))
+                        continue
+
+                    # header de colunas
+                    if is_column_header_only(row):
+                        continue
+
+                    c0 = row_get(row, 0)
+                    c0_flat = colapsar_espacos(c0)
+
+                    # às vezes cai "ANEXO 3" dentro
+                    if "ANEXO 3" in c0_flat.upper():
+                        continue
+
+                    rtype = detect_row_type(c0)
+                    if rtype is None:
+                        continue
+
+                    entry = build_entry_from_row(row, rtype)
+
+                    if rtype == "composicao":
+                        # fecha anterior
+                        if current_bloco is not None:
+                            pid = _make_id(current_bloco.principal.codigo, current_bloco.principal.banco)
+                            principais[pid] = current_bloco
+
+                        pid_norm = _make_id_norm(entry["codigo"], entry["banco"])
+                        item_final = current_item or id_to_item.get(pid_norm, "")
+
+                        principal = LinhaComposicao(
+                            codigo=entry["codigo"],
+                            banco=entry["banco"],
+                            descricao=entry["descricao"],
+                            tipo=entry["tipo"],
+                            und=entry["und"],
+                            quant=entry["quant"],
+                            valor_unit=entry["valor_unit"],
+                            total=entry["total"],
+                        )
+
+                        current_bloco = BlocoComposicao(
+                            item=item_final,
+                            principal=principal,
+                            composicoes_auxiliares=[],
+                            insumos=[],
+                        )
+
+                    else:
+                        if current_bloco is None:
+                            # caiu no meio do bloco (range começa no meio) -> ignora
+                            continue
+
+                        if rtype == "composicao_auxiliar":
+                            aux = LinhaComposicao(
+                                codigo=entry["codigo"],
+                                banco=entry["banco"],
+                                descricao=entry["descricao"],
+                                tipo=entry["tipo"],
+                                und=entry["und"],
+                                quant=entry["quant"],
+                                valor_unit=entry["valor_unit"],
+                                total=entry["total"],
+                            )
+                            current_bloco.composicoes_auxiliares.append(aux)
+
+                            aux_id = _make_id(aux.codigo, aux.banco)
+                            auxiliares_globais[aux_id] = aux
+
+                        elif rtype == "insumo":
+                            ins = LinhaInsumo(
+                                codigo=entry["codigo"],
+                                banco=entry["banco"],
+                                descricao=entry["descricao"],
+                                tipo=entry["tipo"],
+                                und=entry["und"],
+                                quant=entry["quant"],
+                                valor_unit=entry["valor_unit"],
+                                total=entry["total"],
+                            )
+                            current_bloco.insumos.append(ins)
+
+        # fecha último
+        if current_bloco is not None:
+            pid = _make_id(current_bloco.principal.codigo, current_bloco.principal.banco)
+            principais[pid] = current_bloco
+
+        comp = Composicoes(principais=principais, auxiliares_globais=auxiliares_globais)
+
+        avisos.append(
+            f"[composicoes] processadas páginas {start_idx+1}-{end_idx+1}; "
+            f"principais={len(comp.principais)}; auxiliares_globais={len(comp.auxiliares_globais)}"
+        )
+
+        # faltando / extras (considera só principais)
+        itens_faltando: List[str] = []
+        itens_extras: List[str] = []
+
+        if item_refs:
+            expected_norm_to_raw: Dict[str, str] = {}
+            for r in item_refs:
+                rid = str(r.get("ref_id") or "").strip()
+                if not rid or "|" not in rid:
+                    continue
+                c, b = rid.split("|", 1)
+                expected_norm_to_raw[_make_id_norm(c, b)] = rid
+
+            detected_norm = {_make_id_norm(k.split("|", 1)[0], k.split("|", 1)[1]) for k in comp.principais.keys()}
+            expected_norm = set(expected_norm_to_raw.keys())
+
+            missing_norm = sorted(expected_norm - detected_norm)
+            extra_norm = sorted(detected_norm - expected_norm)
+
+            itens_faltando = [expected_norm_to_raw[m] for m in missing_norm if m in expected_norm_to_raw]
+            itens_extras = extra_norm  # raríssimo, mas ajuda a debugar
+
+            if len(comp.principais) == 0:
+                avisos.append(
+                    "[composicoes] 0 composições detectadas no intervalo. "
+                    "Se esse PDF não contém ANEXO 3, ou o range da API não aponta para ele, o resultado será vazio."
+                )
+
+        return comp, avisos, erros, itens_faltando, itens_extras
+
+parser.py
+from __future__ import annotations
+
+import re
+import unicodedata
+from typing import Any, Dict, List, Tuple, Optional
+
+from app.core.pdf_text import extract_pages_text, normalize_lines
+from app.core.money import parse_ptbr_number
+from app.core.sanitizer import (
+    break_glued_markers,
+    sanitize_lines,
+    is_safe_continuation,
+    clean_inline,
+    contains_any,
+)
+from app.core.schemas import ParseResponse, OrcamentoSintetico, Composicoes, Validacao
+
+from app.bases.sinapi.composicoes_parser import parse_composicoes_sinapi
+
+
+_NUM = r"\d{1,3}(?:\.\d{3})*(?:,\d+)?|\d+(?:,\d+)?"
+
+
+# =====================
+# ORÇAMENTO (SINTÉTICO)
+# =====================
+_RE_ITEM_START = re.compile(
+    rf"^(?P<item>\d+(?:\.\d+)*)\s+(?P<codigo>[0-9A-Z_]+)\s+(?P<fonte>SINAPI|Próprio)\s+(?P<rest>.+)$",
+    re.IGNORECASE,
+)
+
+# fallback: linhas do orçamento do tipo "7.5 COMPOSIÇÃO Próprio ...."
+_RE_ITEM_COMPOSICAO_START = re.compile(
+    rf"^(?P<item>\d+(?:\.\d+)*)\s+COMPOSI(?:ÇÃO|CAO)\s+(?P<fonte>SINAPI|Próprio)\s+(?P<rest>.+)$",
+    re.IGNORECASE,
+)
+
+# UND aceita letras/dígitos e símbolos (ex.: m², M3XKM)
+_RE_ITEM_TAIL = re.compile(
+    rf"\s(?P<und>[A-Za-z0-9/%²³]+)\s+(?P<quant>{_NUM})\s+(?P<s_bdi>{_NUM})\s+(?P<c_bdi>{_NUM})\s+(?P<parcial>{_NUM})\s*$"
+)
+
+_RE_GROUP_WITH_TOTAL = re.compile(rf"^(?P<item>\d+(?:\.\d+)*)\s+(?P<desc>.+?)\s+(?P<total>{_NUM})\s*$")
+_RE_GROUP_NO_TOTAL = re.compile(r"^(?P<item>\d+(?:\.\d+)*)\s+(?P<desc>.+?)\s*$")
+_RE_ONLY_NUMBER = re.compile(rf"^(?P<num>{_NUM})$")
+
+# Palavras que, se aparecerem na "descrição do grupo", sugerem que NÃO é grupo (ex.: linha de item/colunas)
+_GROUP_BLACKLIST = ("SINAPI", "PRÓPRIO", "COMPOSIÇÃO", "UND", "QUANT", "CUSTO", "BDI", "%")
+
+
+def parse_sinapi(
+    pdf_bytes: bytes,
+    ranges: Dict[str, Tuple[int, int]],
+    config: dict,
+    context: dict | None = None,
+) -> Dict[str, Any]:
+    """
+    Parser SINAPI (Orçamento Sintético + Composições Analíticas).
+
+    - ranges["orcamento"] = (ini, fim) 1-based
+    - ranges["composicoes"] = (ini, fim) 1-based (ou (0,0) para pular)
+    """
+    context = context or {}
+
+    avisos: List[str] = []
+    erros: List[str] = []
+    divergencias: List[dict] = []
+
+    # ===== ORÇAMENTO =====
+    o_ini, o_fim = ranges.get("orcamento", (0, 0))
+    if o_ini and o_fim and o_ini >= 1 and o_fim >= o_ini:
+        pages_text = extract_pages_text(pdf_bytes, o_ini, o_fim)
+        orc, a, e, d = _parse_orcamento_sintetico(pages_text, config=config, context=context)
+        avisos.extend(a); erros.extend(e); divergencias.extend(d)
+    else:
+        orc = OrcamentoSintetico(itens_raiz=[], itens_plano=[])
+        avisos.append("Orçamento: intervalo de páginas inválido -> orçamento não processado.")
+
+    # refs para validar/associar composições
+    item_refs = _collect_item_refs(orc.itens_raiz)
+
+    # ===== COMPOSIÇÕES =====
+    comp = Composicoes(principais={}, auxiliares_globais={})
+    itens_faltando: List[str] = []
+    itens_extras: List[str] = []
+
+    c_ini, c_fim = ranges.get("composicoes", (0, 0))
+
+    # IMPORTANTÍSSIMO:
+    # - Se o range de composições for inválido, NÃO faz sentido marcar 100% dos itens como faltando.
+    # - O JSON anterior veio com composições vazias + itens_faltando com todos os itens do orçamento,
+    #   que é exatamente esse caso.
+    if not (c_ini and c_fim and c_ini >= 1 and c_fim >= c_ini):
+        avisos.append(
+            "Composições: não processadas (composicoes_inicio/fim inválidos ou 0). "
+            "Dica: se você quer composições no JSON, envie um intervalo 1-based válido."
+        )
+    else:
+        comp, comp_avisos, comp_erros, itens_faltando, itens_extras = parse_composicoes_sinapi(
+            pdf_bytes=pdf_bytes,
+            start_1based=c_ini,
+            end_1based=c_fim,
+            config=config,
+            itens_plano=orc.itens_plano,
+            item_refs=item_refs,
+            context=context,
+        )
+        avisos.extend(comp_avisos)
+        erros.extend(comp_erros)
+
+        # debug útil (não quebra schema)
+        avisos.append(
+            f"Composições: processadas páginas {c_ini}-{c_fim}; "
+            f"principais={len(comp.principais)}; auxiliares_globais={len(comp.auxiliares_globais)}."
+        )
+
+        if len(comp.principais) == 0:
+            avisos.append(
+                "Composições: 0 composições detectadas nesse intervalo. "
+                "Se o PDF realmente tem composições ali, isso indica que a extração de texto está colando linhas "
+                "ou os marcadores/headers estão diferentes do esperado (ver composicoes_parser.py)."
+            )
+
+    resp = ParseResponse(
+        base_id="sinapi",
+        orcamento_sintetico=orc,
+        composicoes=comp,
+        validacao=Validacao(
+            itens_faltando=itens_faltando,
+            itens_extras=itens_extras,
+            avisos=avisos,
+            erros=erros,
+            divergencias=divergencias,
+        ),
+    )
+    return resp.model_dump()
+
+
+# --------------------
+# ORÇAMENTO: helpers
+# --------------------
+
+def _build_dynamic_markers(context: dict) -> List[str]:
+    """
+    Gera marcadores para 'limpeza' de texto (obra_nome/localizacao),
+    incluindo variantes 'coladas' (sem espaços) e sem acentos,
+    porque alguns PDFs removem espaços/acentos na extração.
+    """
+    def deaccent(s: str) -> str:
+        s = unicodedata.normalize("NFD", s)
+        return "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+
+    out: List[str] = []
+    for k in ("obra_nome", "obra_localizacao"):
+        v = context.get(k)
+        if not v:
+            continue
+        s = str(v).strip()
+        if not s:
+            continue
+        out.append(s)
+        out.append(s.replace(" ", ""))
+        out.append(deaccent(s))
+        out.append(deaccent(s).replace(" ", ""))
+    # remove duplicados preservando ordem
+    seen = set()
+    uniq = []
+    for m in out:
+        if m not in seen:
+            uniq.append(m); seen.add(m)
+    return uniq
+
+
+def _parse_orcamento_sintetico(
+    pages_text: List[str],
+    config: dict,
+    context: dict,
+) -> tuple[OrcamentoSintetico, List[str], List[str], List[dict]]:
+    syn = config.get("synthetic", {})
+    san = config.get("sanitizer", {})
+    val = config.get("validation", {})
+
+    ignore_markers = set(syn.get("ignore_markers", []))
+    header_markers = set(syn.get("header_markers", []))
+
+    break_before = san.get("break_before", [])
+    strip_inline_from = san.get("strip_inline_from", [])
+    drop_lines_if_contains = san.get("drop_lines_if_contains", [])
+    toxic_for_continuation = san.get("toxic_for_continuation", [])
+
+    # “deixar vazio”
+    missing_total_value = val.get("missing_group_total_value", "")
+    allow_missing_group_total = bool(val.get("allow_missing_group_total", True))
+    fail_if_contaminated_text = bool(val.get("fail_if_contaminated_text", True))
+
+    tol_item_abs = float(val.get("tolerances", {}).get("item_abs", 0.02))
+    tol_item_rel = float(val.get("tolerances", {}).get("item_rel", 0.0002))
+    tol_group_abs = float(val.get("tolerances", {}).get("group_abs", 0.05))
+    tol_group_rel = float(val.get("tolerances", {}).get("group_rel", 0.0001))
+
+    dynamic_markers = _build_dynamic_markers(context)
+
+    raw_lines: List[str] = []
+    for page_text in pages_text:
+        fixed = break_glued_markers(page_text, break_before=break_before, dynamic_markers=dynamic_markers)
+        for ln in normalize_lines(fixed):
+            if any(m in ln for m in ignore_markers):
+                continue
+            if ln in header_markers:
+                continue
+            if ln.startswith("CUSTO UNITÁRIO") or ln.startswith("ITEM CÓDIGO") or ln.startswith("S/"):
+                continue
+            raw_lines.append(ln)
+
+    raw_lines = sanitize_lines(
+        raw_lines,
+        drop_lines_if_contains=drop_lines_if_contains,
+        strip_inline_from=strip_inline_from,
+        dynamic_markers=dynamic_markers,
+    )
+
+    # recorte do bloco do orçamento
+    started = False
+    lines: List[str] = []
+    for ln in raw_lines:
+        if not started:
+            mg = _RE_GROUP_WITH_TOTAL.match(ln)
+            if mg and _is_probable_group_heading(mg.group("desc")):
+                started = True
+                lines.append(ln)
+        else:
+            if "TOTAL SEM BDI" in ln or "TOTAL COM BDI" in ln:
+                break
+            lines.append(ln)
+
+    avisos: List[str] = []
+    erros: List[str] = []
+    divergencias: List[dict] = []
+
+    if not lines:
+        erros.append("Nenhuma linha do orçamento sintético foi detectada no intervalo informado.")
+        return OrcamentoSintetico(itens_raiz=[], itens_plano=[]), avisos, erros, divergencias
+
+    root = {"tipo": "raiz", "filhos": []}
+    stack: List[tuple[int, dict]] = [(0, root)]
+    itens_plano: List[str] = []
+    last_item_node: Optional[dict] = None
+    buf_item: List[str] = []
+
+    def normalize_group_total(v: str) -> str:
+        return (v or "").strip()  # não inventa texto
+
+    def push_node(node: dict):
+        nonlocal last_item_node
+        level = node["item"].count(".") + 1
+        while stack and stack[-1][0] >= level:
+            stack.pop()
+        parent = stack[-1][1]
+        parent.setdefault("filhos", []).append(node)
+        stack.append((level, node))
+        if node.get("tipo") == "item":
+            last_item_node = node
+
+    def _try_parse_composicao_item_row(line: str) -> Optional[dict]:
+        """
+        Parser fallback para linhas do orçamento sintético do tipo:
+        7.5 COMPOSIÇÃO Próprio PINTURA ... m² 220,14 81,34 101,58 22.361,82
+
+        Regra combinada:
+        - NÃO tenta "adivinhar" sufixo/código quebrado (ex.: E02).
+        - Apenas marca como irregularidade via aviso (no chamador), e usa código base "COMPOSICAO".
+        """
+        m = _RE_ITEM_COMPOSICAO_START.match(line)
+        if not m:
+            return None
+
+        item = m.group("item").strip()
+        fonte = m.group("fonte").strip()
+        rest = m.group("rest").strip()
+
+        mt = _RE_ITEM_TAIL.search(line)
+        if not mt:
+            return None
+
+        und = mt.group("und").strip()
+        quant = mt.group("quant").strip()
+        s_bdi = mt.group("s_bdi").strip()
+        c_bdi = mt.group("c_bdi").strip()
+        parcial = mt.group("parcial").strip()
+
+        especificacao = _RE_ITEM_TAIL.sub("", rest).strip()
+        especificacao = clean_inline(especificacao, strip_inline_from, dynamic_markers=dynamic_markers)
+
+        return {
+            "tipo": "item",
+            "item": item,
+            "codigo": "COMPOSICAO",
+            "fonte": fonte,
+            "especificacao": especificacao,
+            "und": und,
+            "quant": quant,
+            "custo_unitario_sem_bdi": s_bdi,
+            "custo_unitario_com_bdi": c_bdi,
+            "custo_parcial": parcial,
+        }
+
+    def try_finalize_item(buffer_lines: List[str], lookahead_lines: List[str]) -> tuple[Optional[dict], int]:
+        max_extra = min(2, len(lookahead_lines))
+        cur = list(buffer_lines)
+
+        for extra_used in range(0, max_extra + 1):
+            text = " ".join(cur)
+
+            parsed = _try_parse_item_row(text, strip_inline_from=strip_inline_from, dynamic_markers=dynamic_markers)
+            if not parsed:
+                # fallback: COMPOSIÇÃO no orçamento
+                parsed = _try_parse_composicao_item_row(buffer_lines[0])
+
+                if parsed:
+                    avisos.append(
+                        f"Item {parsed.get('item')} com irregularidade: linha indica COMPOSIÇÃO com código quebrado/ausente. "
+                        "Mantido como codigo='COMPOSICAO'. Revisar se houver inconsistência nas composições."
+                    )
+
+            if parsed:
+                ok, reason = _validate_item_math(
+                    parsed,
+                    tol_abs=tol_item_abs,
+                    tol_rel=tol_item_rel,
+                    fail_if_contaminated_text=fail_if_contaminated_text,
+                    toxic_markers=strip_inline_from,
+                    dynamic_markers=dynamic_markers,
+                )
+                if ok:
+                    return parsed, extra_used
+
+                divergencias.append({
+                    "tipo": "item",
+                    "item": parsed.get("item"),
+                    "quant": parsed.get("quant"),
+                    "custo_unitario_com_bdi": parsed.get("custo_unitario_com_bdi"),
+                    "custo_parcial": parsed.get("custo_parcial"),
+                    "motivo": reason,
+                })
+
+                if extra_used < max_extra and not _looks_like_new_row(lookahead_lines[extra_used]):
+                    cur.append(lookahead_lines[extra_used])
+                    continue
+
+                erros.append(f"Item {parsed.get('item')} falhou validação: {reason}")
+                return parsed, extra_used
+
+            if extra_used < max_extra and not _looks_like_new_row(lookahead_lines[extra_used]):
+                cur.append(lookahead_lines[extra_used])
+                continue
+
+            return None, extra_used
+
+        return None, 0
+
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+
+        # multi-linha de item
+        if buf_item:
+            if _looks_like_new_row(ln):
+                parsed, used = try_finalize_item(buf_item, lines[i:i+3])
+                buf_item = []
+                if parsed:
+                    push_node(parsed)
+                    itens_plano.append(parsed["item"])
+                    i += used
+                continue
+
+            buf_item.append(ln)
+            if _RE_ITEM_TAIL.search(" ".join(buf_item)):
+                parsed, used = try_finalize_item(buf_item, lines[i+1:i+3])
+                buf_item = []
+                if parsed:
+                    push_node(parsed)
+                    itens_plano.append(parsed["item"])
+                    i += used
+            i += 1
+            continue
+
+        # item start (normal ou COMPOSIÇÃO)
+        if _RE_ITEM_START.match(ln) or _RE_ITEM_COMPOSICAO_START.match(ln):
+            buf_item = [ln]
+
+            if _RE_ITEM_TAIL.search(ln):
+                parsed, used = try_finalize_item(buf_item, lines[i + 1:i + 3])
+                buf_item = []
+                if parsed:
+                    push_node(parsed)
+                    itens_plano.append(parsed["item"])
+                    i += used
+            i += 1
+            continue
+
+        # Grupo com total
+        mg = _RE_GROUP_WITH_TOTAL.match(ln)
+        if mg:
+            item = mg.group("item").strip()
+            desc = mg.group("desc").strip()
+            total = mg.group("total").strip()
+
+            if not _is_probable_group_heading(desc):
+                # 1) tenta como continuação do item anterior
+                if last_item_node and is_safe_continuation(
+                    last_item_node.get("especificacao", ""),
+                    ln,
+                    toxic_for_continuation,
+                    dynamic_markers=dynamic_markers,
+                ):
+                    last_item_node["especificacao"] = (
+                        last_item_node.get("especificacao", "") + " " + clean_inline(ln, strip_inline_from, dynamic_markers=dynamic_markers)
+                    ).strip()
+                else:
+                    # 2) NÃO ignora: inclui como grupo, mas avisa que é suspeito
+                    avisos.append(f"Grupo suspeito incluído (revisar): {ln[:180]}")
+                    tipo = "meta" if "." not in item else "submeta"
+                    push_node({"tipo": tipo, "item": item, "descricao": desc, "custo_total": normalize_group_total(total), "filhos": []})
+                i += 1
+                continue
+
+            tipo = "meta" if "." not in item else "submeta"
+            push_node({"tipo": tipo, "item": item, "descricao": desc, "custo_total": normalize_group_total(total), "filhos": []})
+            i += 1
+            continue
+
+        # Grupo sem total
+        mg2 = _RE_GROUP_NO_TOTAL.match(ln)
+        if mg2 and _is_probable_group_heading(mg2.group("desc")):
+            item = mg2.group("item").strip()
+            desc = mg2.group("desc").strip()
+
+            total = ""
+            if i + 1 < len(lines):
+                mn = _RE_ONLY_NUMBER.match(lines[i + 1])
+                if mn:
+                    total = mn.group("num").strip()
+                    i += 1
+
+            if not total:
+                if allow_missing_group_total:
+                    total = missing_total_value  # vazio
+                    avisos.append(f"Grupo {item} sem CUSTO TOTAL no documento -> vazio.")
+                else:
+                    erros.append(f"Grupo {item} sem CUSTO TOTAL e allow_missing_group_total=false.")
+                    total = missing_total_value
+
+            tipo = "meta" if "." not in item else "submeta"
+            push_node({"tipo": tipo, "item": item, "descricao": desc, "custo_total": normalize_group_total(total), "filhos": []})
+            i += 1
+            continue
+
+        # Continuação segura
+        if last_item_node and is_safe_continuation(last_item_node.get("especificacao", ""), ln, toxic_for_continuation, dynamic_markers=dynamic_markers):
+            last_item_node["especificacao"] = (last_item_node.get("especificacao", "") + " " + clean_inline(ln, strip_inline_from, dynamic_markers=dynamic_markers)).strip()
+            i += 1
+            continue
+
+        avisos.append(f"Linha ignorada (não casou com item/grupo): {ln[:180]}")
+        i += 1
+
+    if buf_item:
+        parsed, _used = try_finalize_item(buf_item, [])
+        if parsed:
+            push_node(parsed)
+            itens_plano.append(parsed["item"])
+        buf_item = []
+
+    _validate_tree_math(
+        root.get("filhos", []),
+        avisos=avisos,
+        erros=erros,
+        divergencias=divergencias,
+        tol_abs=tol_group_abs,
+        tol_rel=tol_group_rel,
+        missing_total_value=missing_total_value,
+    )
+
+    return OrcamentoSintetico(itens_raiz=root["filhos"], itens_plano=itens_plano), avisos, erros, divergencias
+
+
+def _try_parse_item_row(text: str, strip_inline_from: List[str], dynamic_markers: List[str]) -> Optional[dict]:
+    m = _RE_ITEM_START.match(text)
+    if not m:
+        return None
+
+    item = m.group("item").strip()
+    codigo = m.group("codigo").strip()
+    fonte = m.group("fonte").strip()
+    rest = m.group("rest").strip()
+
+    mt = _RE_ITEM_TAIL.search(text)
+    if not mt:
+        return None
+
+    und = mt.group("und").strip()
+    quant = mt.group("quant").strip()
+    s_bdi = mt.group("s_bdi").strip()
+    c_bdi = mt.group("c_bdi").strip()
+    parcial = mt.group("parcial").strip()
+
+    especificacao = _RE_ITEM_TAIL.sub("", rest).strip()
+    especificacao = clean_inline(especificacao, strip_inline_from, dynamic_markers=dynamic_markers)
+
+    return {
+        "tipo": "item",
+        "item": item,
+        "codigo": codigo,
+        "fonte": fonte,
+        "especificacao": especificacao,
+        "und": und,
+        "quant": quant,
+        "custo_unitario_sem_bdi": s_bdi,
+        "custo_unitario_com_bdi": c_bdi,
+        "custo_parcial": parcial,
+    }
+
+
+def _validate_item_math(
+    item_node: dict,
+    tol_abs: float,
+    tol_rel: float,
+    fail_if_contaminated_text: bool,
+    toxic_markers: List[str],
+    dynamic_markers: List[str],
+) -> tuple[bool, str]:
+    espec = item_node.get("especificacao") or ""
+    if fail_if_contaminated_text and toxic_markers and contains_any(espec, toxic_markers, dynamic_markers=dynamic_markers):
+        return False, "especificacao contaminada (marcadores detectados)"
+
+    q = parse_ptbr_number(item_node.get("quant", ""))
+    u = parse_ptbr_number(item_node.get("custo_unitario_com_bdi", ""))
+    p = parse_ptbr_number(item_node.get("custo_parcial", ""))
+
+    # se algum valor não for parseável, não trava (Lovable resolve)
+    if q is None or u is None or p is None:
+        return True, "campos numéricos não parseáveis (ok)"
+
+    expected = q * u
+    tol = max(tol_abs, abs(expected) * tol_rel)
+
+    if abs(expected - p) <= tol:
+        return True, "ok"
+
+    return False, f"parcial {p:.2f} != quant*unit {expected:.2f} (tol {tol:.2f})"
+
+
+def _validate_tree_math(
+    nodes: List[dict],
+    avisos: List[str],
+    erros: List[str],
+    divergencias: List[dict],
+    tol_abs: float,
+    tol_rel: float,
+    missing_total_value: str,
+) -> float:
+    total_sum = 0.0
+    for node in nodes:
+        if node.get("tipo") == "item":
+            v = parse_ptbr_number(node.get("custo_parcial", "")) or 0.0
+            total_sum += v
+        else:
+            child_sum = _validate_tree_math(
+                node.get("filhos", []),
+                avisos,
+                erros,
+                divergencias,
+                tol_abs,
+                tol_rel,
+                missing_total_value,
+            )
+            total_sum += child_sum
+
+            ct_raw = (node.get("custo_total") or "").strip()
+            if not ct_raw or ct_raw == missing_total_value:
+                continue
+
+            ct = parse_ptbr_number(ct_raw)
+            if ct is None:
+                avisos.append(f"custo_total não numérico em {node.get('item')}: '{ct_raw}'")
+                continue
+
+            tol = max(tol_abs, abs(ct) * tol_rel)
+            diff = child_sum - ct
+
+            divergencias.append({
+                "tipo": "grupo",
+                "item": node.get("item"),
+                "custo_total": ct_raw,
+                "soma_filhos": f"{child_sum:.2f}",
+                "diferenca": f"{diff:.2f}",
+                "tolerancia": f"{tol:.2f}",
+            })
+
+            if abs(diff) > tol:
+                erros.append(
+                    f"Divergência matemática no grupo {node.get('item')} — soma_filhos={child_sum:.2f} vs custo_total={ct:.2f} (tol={tol:.2f})"
+                )
+
+    return total_sum
+
+
+def _looks_like_new_row(ln: str) -> bool:
+    return bool(re.match(r"^\d+(?:\.\d+)*\s+", ln))
+
+
+def _is_probable_group_heading(desc: str) -> bool:
+    up = desc.upper().strip()
+    if len(up) < 3:
+        return False
+    for w in _GROUP_BLACKLIST:
+        if w in up:
+            return False
+    nums = re.findall(rf"{_NUM}", desc)
+    if len(nums) >= 2:
+        return False
+    return True
+
+
+def _collect_item_refs(itens_raiz) -> Dict[str, Dict[str, str]]:
+    """
+    Percorre a árvore do orçamento e monta um mapa por ITEM (ex.: "7.5") com:
+      - codigo
+      - banco/fonte
+      - id = "codigo|banco"
+
+    IMPORTANTE: itens_raiz pode vir como lista de dicts OU lista de Pydantic models.
+    """
+    refs: Dict[str, Dict[str, str]] = {}
+
+    def getv(node, key: str, default=""):
+        # dict
+        if isinstance(node, dict):
+            return node.get(key, default)
+        # pydantic model / objeto
+        if hasattr(node, key):
+            v = getattr(node, key)
+            return v if v is not None else default
+        return default
+
+    def children(node):
+        if isinstance(node, dict):
+            return node.get("filhos") or []
+        if hasattr(node, "filhos"):
+            v = getattr(node, "filhos")
+            return v or []
+        return []
+
+    def walk(nodes):
+        for n in nodes or []:
+            tipo = getv(n, "tipo", "")
+            if tipo == "item":
+                item = str(getv(n, "item", "")).strip()
+                codigo = str(getv(n, "codigo", "")).strip()
+                banco = str(getv(n, "fonte", "")).strip()  # no orçamento, chama "fonte"
+                if item and codigo and banco:
+                    refs[item] = {
+                        "item": item,
+                        "codigo": codigo,
+                        "banco": banco,
+                        "id": f"{codigo}|{banco}",
+                    }
+            walk(children(n))
+
+    walk(itens_raiz)
+    return refs
+
+
+base_loader.py
+from __future__ import annotations
+
+from typing import Dict, Tuple
+
+from app.bases.sinapi.parser import parse_sinapi
+
+
+def parse_document(
+    base_id: str,
+    pdf_bytes: bytes,
+    ranges: Dict[str, Tuple[int, int]],
+    config: dict,
+    context: dict | None = None,
+) -> dict:
+    """
+    Roteador por base (SINAPI, SICRO, etc.)
+    - config: configuração da base (db/base_config.json[base_id])
+    - context: dados dinâmicos (obra_nome, obra_localizacao, etc.)
+    """
+    base_id = (base_id or "").lower().strip()
+    context = context or {}
+
+    if base_id == "sinapi":
+        return parse_sinapi(pdf_bytes=pdf_bytes, ranges=ranges, config=config, context=context)
+
+    raise ValueError(f"Base '{base_id}' não suportada.")
+
+
+config_loader.py
+import json
+from pathlib import Path
+
+
+def load_base_config() -> dict:
+    path = Path("db") / "base_config.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+header_resolver.py
+from __future__ import annotations
+
+import re
+import unicodedata
+from difflib import SequenceMatcher
+from typing import Dict, List, Optional, Tuple
+
+
+def _norm(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = re.sub(r"[^a-z0-9/%\.\s]+", " ", s)
+    s = re.sub(r"\s{2,}", " ", s).strip()
+    return s
+
+
+def _best_match(header_cell: str, aliases: Dict[str, List[str]], min_similarity: float) -> Optional[str]:
+    h = _norm(header_cell)
+    if not h:
+        return None
+
+    # exact / substring
+    for canonical, opts in aliases.items():
+        for opt in opts:
+            o = _norm(opt)
+            if not o:
+                continue
+            if h == o or o in h or h in o:
+                return canonical
+
+    # fuzzy
+    best_key = None
+    best_score = 0.0
+    for canonical, opts in aliases.items():
+        for opt in opts:
+            o = _norm(opt)
+            if not o:
+                continue
+            score = SequenceMatcher(None, h, o).ratio()
+            if score > best_score:
+                best_key, best_score = canonical, score
+
+    if best_score >= float(min_similarity):
+        return best_key
+    return None
+
+
+def resolve_header_map(
+    header_cells: List[str],
+    aliases: Dict[str, List[str]],
+    required: List[str],
+    min_similarity: float = 0.88,
+) -> Tuple[Dict[str, int], List[str]]:
+    mapping: Dict[str, int] = {}
+    for idx, cell in enumerate(header_cells):
+        key = _best_match(cell, aliases=aliases, min_similarity=min_similarity)
+        if key and key not in mapping:
+            mapping[key] = idx
+    missing = [k for k in required if k not in mapping]
+    return mapping, missing
+
+
+money.py
+import re
+from typing import Optional
+
+_PTBR_RE = re.compile(r"-?\d{1,3}(?:\.\d{3})*(?:,\d+)?$|-?\d+(?:,\d+)?$")
+
+
+def parse_ptbr_number(value: str) -> Optional[float]:
+    """Converte '1.234,56' em 1234.56. Retorna None se não parecer número."""
+    if value is None:
+        return None
+    s = value.strip().replace("R$", "").replace(" ", "")
+    if not s:
+        return None
+    if not _PTBR_RE.match(s):
+        return None
+    s = s.replace(".", "").replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+pdf_text.py
+import io
+from typing import List
+import pdfplumber
+
+
+def extract_pages_text(pdf_bytes: bytes, start_1based: int, end_1based: int) -> List[str]:
+    """Extrai texto página a página no intervalo [start,end] (1-based)."""
+    if start_1based < 1 or end_1based < 1:
+        raise ValueError("Páginas devem ser 1-based e >= 1")
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        n = len(pdf.pages)
+        if end_1based > n:
+            raise ValueError(f"PDF tem {n} páginas, mas você pediu até {end_1based}")
+        out = []
+        for idx in range(start_1based - 1, end_1based):
+            t = pdf.pages[idx].extract_text() or ""
+            out.append(t)
+        return out
+
+
+def normalize_lines(text: str) -> List[str]:
+    """Normaliza espaços e remove linhas vazias."""
+    lines = []
+    for raw in text.splitlines():
+        s = " ".join(raw.strip().split())
+        if s:
+            lines.append(s)
+    return lines
+
+sanitizer.py
+from __future__ import annotations
+
+import re
+from typing import Iterable, List, Optional
+
+
+def _normalize_space(s: str) -> str:
+    return re.sub(r"\s{2,}", " ", (s or "").replace("\u00a0", " ").strip())
+
+
+def _merge_markers(static: List[str], dynamic: Optional[List[str]]) -> List[str]:
+    dyn = [m for m in (dynamic or []) if m and m.strip()]
+    merged = list(dict.fromkeys([m for m in (static or []) if m and m.strip()] + dyn))
+    merged.sort(key=len, reverse=True)
+    return merged
+
+
+def break_glued_markers(text: str, break_before: List[str], dynamic_markers: Optional[List[str]] = None) -> str:
+    if not text:
+        return text or ""
+    markers = _merge_markers(break_before, dynamic_markers)
+    if not markers:
+        return text
+    pattern = r"(?=(" + "|".join(re.escape(m) for m in markers) + r"))"
+    rx = re.compile(pattern)
+    return rx.sub("\n", text)
+
+
+def clean_inline(text: str, strip_inline_from: List[str], dynamic_markers: Optional[List[str]] = None) -> str:
+    s = _normalize_space(text)
+    markers = _merge_markers(strip_inline_from, dynamic_markers)
+    if not s or not markers:
+        return s
+    cut_idx = None
+    for m in markers:
+        idx = s.find(m)
+        if idx != -1:
+            cut_idx = idx if cut_idx is None else min(cut_idx, idx)
+    if cut_idx is not None:
+        s = s[:cut_idx].rstrip()
+    return _normalize_space(s)
+
+
+def sanitize_lines(
+    lines: Iterable[str],
+    drop_lines_if_contains: List[str],
+    strip_inline_from: List[str],
+    dynamic_markers: Optional[List[str]] = None,
+) -> List[str]:
+    out: List[str] = []
+    for ln in lines:
+        s = _normalize_space(ln)
+        if not s:
+            continue
+        s = clean_inline(s, strip_inline_from=strip_inline_from, dynamic_markers=dynamic_markers)
+        if not s:
+            continue
+        if drop_lines_if_contains and any(m in s for m in drop_lines_if_contains if m):
+            continue
+        out.append(s)
+    return out
+
+
+def contains_any(text: str, markers: List[str], dynamic_markers: Optional[List[str]] = None) -> bool:
+    s = text or ""
+    merged = _merge_markers(markers, dynamic_markers)
+    return any(m in s for m in merged)
+
+
+def is_safe_continuation(prev_text: str, next_line: str, toxic_for_continuation: List[str], dynamic_markers: Optional[List[str]] = None) -> bool:
+    s = _normalize_space(next_line)
+    if not s:
+        return False
+    if re.match(r"^\d+(?:\.\d+)*\s+\S+", s):
+        return False
+    if contains_any(s, toxic_for_continuation, dynamic_markers=dynamic_markers):
+        return False
+    return True
+
+schemas.py
+from __future__ import annotations
+
+from typing import Dict, List, Literal, Union, Optional
+from pydantic import BaseModel
+
+
+class OrcamentoItem(BaseModel):
+    tipo: Literal["item"]
+    item: str
+    codigo: str
+    fonte: str
+    especificacao: str
+    und: str
+    quant: str
+    custo_unitario_sem_bdi: str
+    custo_unitario_com_bdi: str
+    custo_parcial: str
+
+
+class OrcamentoGrupo(BaseModel):
+    tipo: Literal["meta", "submeta"]
+    item: str
+    descricao: str
+    custo_total: str
+    filhos: List["OrcamentoNode"]
+
+
+OrcamentoNode = Union[OrcamentoGrupo, OrcamentoItem]
+OrcamentoGrupo.model_rebuild()
+
+
+class OrcamentoSintetico(BaseModel):
+    itens_raiz: List[OrcamentoNode]
+    itens_plano: List[str]
+
+
+class LinhaComposicao(BaseModel):
+    codigo: str
+    banco: str
+    descricao: str
+    und: str
+    quant: str
+    valor_unit: str
+    total: str
+
+
+class BlocoComposicao(BaseModel):
+    item: Optional[str] = None
+    principal: LinhaComposicao
+    composicoes_auxiliares: List[LinhaComposicao] = []
+    insumos: List[LinhaComposicao] = []
+
+
+class Composicoes(BaseModel):
+    # principais: dicionário por item (ex.: "7.1") quando conseguimos associar ao orçamento
+    principais: Dict[str, BlocoComposicao]
+    # auxiliares_globais: quando não dá para associar ao item, usamos a chave "codigo|banco"
+    auxiliares_globais: Dict[str, BlocoComposicao]
+
+
+class Validacao(BaseModel):
+    itens_faltando: List[str] = []
+    itens_extras: List[str] = []
+    avisos: List[str] = []
+    erros: List[str] = []
+    divergencias: List[dict] = []
+
+
+class ParseResponse(BaseModel):
+    base_id: str
+    orcamento_sintetico: OrcamentoSintetico
+    composicoes: Composicoes
+    validacao: Validacao
+
+
+main.py
+print("Executandooooooo")
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.openapi.utils import get_openapi
+
+from app.bases.base_loader import parse_document
+from app.core.config_loader import load_base_config
+from app.core.schemas import ParseResponse
+
+app = FastAPI()
+
+
+def custom_openapi():
+    app.openapi_schema = get_openapi(
+        title="PDF Import API",
+        version="0.1.0",
+        routes=app.routes,
+    )
+    return app.openapi_schema
+
+
+app.openapi = custom_openapi
+
+
+@app.post("/parse", response_model=ParseResponse)
+async def parse_endpoint(
+    base_id: str = Form(...),
+    orcamento_inicio: int = Form(...),
+    orcamento_fim: int = Form(...),
+    composicoes_inicio: int = Form(...),
+    composicoes_fim: int = Form(...),
+    obra_nome: str | None = Form(None),
+    obra_localizacao: str | None = Form(None),
+    pdf: UploadFile = File(...),
+):
+    pdf_bytes = await pdf.read()
+
+    config_all = load_base_config()
+    base_cfg = config_all.get(base_id)
+    if not base_cfg:
+        raise HTTPException(status_code=400, detail=f"Base '{base_id}' não cadastrada em db/base_config.json")
+
+    context = {"obra_nome": obra_nome, "obra_localizacao": obra_localizacao}
+
+    # ranges com skip profissional
+    ranges = {"orcamento": (orcamento_inicio, orcamento_fim)}
+    if composicoes_inicio >= 1 and composicoes_fim >= composicoes_inicio:
+        ranges["composicoes"] = (composicoes_inicio, composicoes_fim)
+    else:
+        ranges["composicoes"] = (0, 0)
+
+    result = parse_document(
+        base_id=base_id,
+        pdf_bytes=pdf_bytes,
+        ranges=ranges,
+        config=base_cfg,
+        context=context,
+    )
+
+    strict = bool(base_cfg.get("validation", {}).get("strict", True))
+    v = result.get("validacao", {})
+    if strict and v.get("erros"):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "Falha de validação.",
+                "erros": v.get("erros", []),
+                "avisos": v.get("avisos", []),
+                "divergencias": v.get("divergencias", []),
+            },
+        )
+
+    return result
+
+
+
+base_config.json
+{
+  "sinapi": {
+    "page_indexing": "1-based",
+    "synthetic": {
+      "header_markers": ["ANEXO 1 - ORÇAMENTO SINTÉTICO"],
+      "ignore_markers": ["ESTADO DO ACRE", "SECRETARIA", "PARÂMETROS SINAPI"]
+    },
+    "compositions": {
+      "header_markers": ["ANEXO 3", "COMPOSIÇÕES ANALÍTICAS"],
+      "ignore_markers": ["ESTADO DO ACRE", "SECRETARIA", "PARÂMETROS SINAPI"]
+    },
+    "sanitizer": {
+      "break_before": ["ESTADO DO", "SECRETARIA", "PARÂMETROS", "Objeto:", "Município:", "Endereço:", "Data-base", "Enc. Sociais", "Página", "ANEXO"],
+      "strip_inline_from": ["ESTADO DO", "SECRETARIA", "PARÂMETROS", "Objeto:", "Município:", "Endereço:", "Data-base", "Enc. Sociais", "Página", "ANEXO"],
+      "drop_lines_if_contains": ["ANEXO 1 - ORÇAMENTO SINTÉTICO", "ITEM CÓDIGO FONTE", "CUSTO UNITÁRIO"],
+      "toxic_for_continuation": ["ESTADO DO", "SECRETARIA", "PARÂMETROS", "Objeto:", "Município:", "Endereço:", "Data-base", "Enc. Sociais", "Página", "ANEXO"]
+    },
+    "validation": {
+      "strict": false,
+      "allow_missing_group_total": true,
+      "missing_group_total_value": "",
+      "fail_if_contaminated_text": true,
+      "tolerances": {
+        "item_abs": 0.02,
+        "item_rel": 0.0002,
+        "group_abs": 0.05,
+        "group_rel": 0.0001
+      }
+    },
+    "table_headers": {
+      "aliases": {
+        "item": ["ITEM"],
+        "codigo": ["CÓDIGO", "CODIGO", "CÓD."],
+        "fonte": ["FONTE"],
+        "especificacao": ["ESPECIFICAÇÕES DOS SERVIÇOS", "ESPECIFICAÇÕES", "ESPECIFICACOES", "DESCRIÇÃO", "DESCRICAO"],
+        "und": ["UND", "UNIDADE", "UNID", "U.M.", "UM", "UN"],
+        "quant": ["QUANT", "QUANT.", "QTD", "QUANTIDADE"],
+        "custo_unitario_sem_bdi": ["CUSTO UNITÁRIO S/BDI", "S/BDI", "SEM BDI"],
+        "custo_unitario_com_bdi": ["CUSTO UNITÁRIO C/BDI", "C/BDI", "COM BDI"],
+        "custo_parcial": ["CUSTO PARCIAL", "PARCIAL", "TOTAL PARCIAL"],
+        "custo_total": ["CUSTO TOTAL", "TOTAL"]
+      },
+      "required": ["item", "codigo", "fonte", "und", "quant", "custo_parcial"],
+      "min_similarity": 0.88
+    }
+  }
+}
+
+
+test_smoke.py
+
+from fastapi.testclient import TestClient
+from app.main import app
+
+def test_health():
+    c = TestClient(app)
+    r = c.get("/health")
+    assert r.status_code == 200
+    assert r.json()["ok"] is True
+

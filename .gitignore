@@ -1,0 +1,69 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+
+# Virtualenv
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# Build / dist
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Unit test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.mypy_cache/
+.pyre/
+.pytype/
+ruff_cache/
+
+# Logs
+*.log
+
+# =========================
+# FastAPI / Uvicorn
+# =========================
+# (geralmente logs e arquivos locais)
+uvicorn*.log
+
+# =========================
+# Environment / Secrets
+# =========================
+.env
+.env.*
+*.env
+secrets.*
+*.pem
+*.key
+
+# =========================
+# PyCharm / JetBrains
+# =========================
+.idea/
+*.iml
+
+# =========================
+# OS files
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# Jupyter (se usar)
+# =========================
+.ipynb_checkpoints/
