@@ -629,46 +629,38 @@ def _is_probable_group_heading(desc: str) -> bool:
     return True
 
 
-def _collect_item_refs(itens_raiz) -> List[Dict[str, Any]]:
+from typing import Any, Dict, List
+
+def _collect_item_refs(itens_raiz: Any) -> List[Dict[str, str]]:
     """
     Retorna lista de refs:
-      [{
-        "item":"9.4",
-        "ref_id":"CODIGO|BANCO",
-        "codigo":"...",
-        "banco":"SINAPI",
-        "quant": float|None,
-        "sem_bdi": float|None,
-        "com_bdi": float|None,
-        "parcial": float|None,
-      }, ...]
+      [{"item":"9.4", "ref_id":"CODIGO|BANCO"}, ...]
+    Aceita nós como dict OU como Pydantic (OrcamentoItem).
     """
-    refs: List[Dict[str, Any]] = []
+    refs: List[Dict[str, str]] = []
 
-    def children(node):
+    def _get(node: Any, key: str, default: Any = "") -> Any:
+        if node is None:
+            return default
         if isinstance(node, dict):
-            return node.get("filhos") or []
-        return []
+            return node.get(key, default)
+        # Pydantic/BaseModel (OrcamentoItem)
+        return getattr(node, key, default)
 
-    def walk(nodes):
+    def _children(node: Any) -> List[Any]:
+        ch = _get(node, "filhos", []) or []
+        return list(ch)
+
+    def _walk(nodes: Any):
         for n in nodes or []:
-            tipo = str((n.get("tipo") or "")).strip().lower()
+            tipo = str(_get(n, "tipo", "") or "").strip().lower()
             if tipo == "item":
-                item = str(n.get("item") or "").strip()
-                codigo = str(n.get("codigo") or "").strip()
-                banco = str(n.get("fonte") or "").strip()  # no orçamento chama "fonte"
+                item = str(_get(n, "item", "") or "").strip()
+                codigo = str(_get(n, "codigo", "") or "").strip()
+                banco = str(_get(n, "fonte", "") or "").strip()  # no orçamento chama "fonte"
                 if item and codigo and banco:
-                    refs.append({
-                        "item": item,
-                        "ref_id": f"{codigo}|{banco}",
-                        "codigo": codigo,
-                        "banco": banco,
-                        "quant": parse_ptbr_number(n.get("quant") or ""),
-                        "sem_bdi": parse_ptbr_number(n.get("custo_unitario_sem_bdi") or ""),
-                        "com_bdi": parse_ptbr_number(n.get("custo_unitario_com_bdi") or ""),
-                        "parcial": parse_ptbr_number(n.get("custo_parcial") or ""),
-                    })
-            walk(children(n))
+                    refs.append({"item": item, "ref_id": f"{codigo}|{banco}"})
+            _walk(_children(n))
 
-    walk(itens_raiz)
+    _walk(itens_raiz)
     return refs
