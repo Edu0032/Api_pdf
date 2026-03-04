@@ -15,6 +15,7 @@ from app.core.sanitizer import (
 )
 from app.core.schemas import ParseResponse, OrcamentoSintetico, Composicoes, Validacao
 from app.bases.sinapi.composicoes_parser import parse_composicoes_sinapi
+from app.postprocess.ai_refiner import refine_composicoes_with_ai
 
 
 _NUM = r"\d{1,3}(?:\.\d{3})*(?:,\d+)?|\d+(?:,\d+)?"
@@ -141,6 +142,16 @@ def parse_sinapi(
         )
         avisos.extend(comp_avisos)
         erros.extend(comp_erros)
+
+        if bool(config.get("postprocess", {}).get("ai_refiner", {}).get("enabled", True)):
+            ai_cfg = config.get("postprocess", {}).get("ai_refiner", {})
+            comp, ai_avisos = refine_composicoes_with_ai(
+                comp,
+                item_refs_list,
+                min_confidence=float(ai_cfg.get("min_confidence", 0.68)),
+                min_correction_similarity=float(ai_cfg.get("min_correction_similarity", 0.84)),
+            )
+            avisos.extend(ai_avisos)
 
         avisos.append(
             f"Composições: processadas páginas {c_ini}-{c_fim}; "
@@ -677,7 +688,13 @@ def _collect_item_refs(itens_raiz) -> List[Dict[str, str]]:
 
                 if item and codigo and banco:
                     if codigo.strip().upper() != "COMPOSICAO" and not _is_probably_insumo_codigo(codigo, banco):
-                        refs.append({"item": item, "ref_id": f"{codigo}|{banco}"})
+                        refs.append({
+                            "item": item,
+                            "ref_id": f"{codigo}|{banco}",
+                            "descricao": str(_node_get(n, "especificacao", "") or "").strip(),
+                            "sem_bdi": _node_get(n, "custo_unitario_sem_bdi", None),
+                            "com_bdi": _node_get(n, "custo_unitario_com_bdi", None),
+                        })
 
             walk(_node_children(n))
 

@@ -72,3 +72,7 @@ async def parse_endpoint(
         )
 
     return result
+
+@app.get("/health")
+def health():
+    return {"ok": True}
