@@ -1,10 +1,10 @@
-print("Executandooooooo")
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.openapi.utils import get_openapi
 
 from app.bases.base_loader import parse_document
 from app.core.config_loader import load_base_config
 from app.core.schemas import ParseResponse
+from app.core.validation_enricher import enrich_validation_payload
 
 app = FastAPI()
 
@@ -12,7 +12,7 @@ app = FastAPI()
 def custom_openapi():
     app.openapi_schema = get_openapi(
         title="PDF Import API",
-        version="0.1.0",
+        version="0.2.0",
         routes=app.routes,
     )
     return app.openapi_schema
@@ -39,11 +39,16 @@ async def parse_endpoint(
     base_cfg = config_all.get(base_id_norm)
 
     if not base_cfg:
-        raise HTTPException(status_code=400, detail=f"Base '{base_id}' não cadastrada em db/base_config.json")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Base '{base_id}' não cadastrada em db/base_config.json",
+        )
 
-    context = {"obra_nome": obra_nome, "obra_localizacao": obra_localizacao}
+    context = {
+        "obra_nome": obra_nome,
+        "obra_localizacao": obra_localizacao,
+    }
 
-    # ranges com skip profissional
     ranges = {"orcamento": (orcamento_inicio, orcamento_fim)}
     if composicoes_inicio >= 1 and composicoes_fim >= composicoes_inicio:
         ranges["composicoes"] = (composicoes_inicio, composicoes_fim)
@@ -58,6 +63,13 @@ async def parse_endpoint(
         context=context,
     )
 
+    result = enrich_validation_payload(
+        result,
+        base_id=base_id_norm,
+        ranges=ranges,
+        context=context,
+    )
+
     strict = bool(base_cfg.get("validation", {}).get("strict", True))
     v = result.get("validacao", {})
     if strict and v.get("erros"):
@@ -68,6 +80,8 @@ async def parse_endpoint(
                 "erros": v.get("erros", []),
                 "avisos": v.get("avisos", []),
                 "divergencias": v.get("divergencias", []),
+                "ocorrencias": v.get("ocorrencias", []),
+                "resumo": v.get("resumo", {}),
             },
         )
 
